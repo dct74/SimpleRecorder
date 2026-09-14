@@ -58,14 +58,21 @@ jobs:
 
       # Exit codes of --selftest: 0 = everything passed, 2 = writer tests passed but
       # the runner has no audio endpoint (capture parts skipped), 1 = failure.
+      # Start-Process -Wait is required: PowerShell does not wait for a GUI
+      # subsystem executable, so $LASTEXITCODE would be empty.
       - name: Self test
         shell: pwsh
         run: |
           $out = Join-Path $env:RUNNER_TEMP 'selftest'
           $log = Join-Path $out 'log.txt'
-          & "${{ steps.artifact.outputs.path }}" --selftest 1 $out $log
-          $code = $LASTEXITCODE
+          $exe = "${{ steps.artifact.outputs.path }}"
+
+          $process = Start-Process -FilePath $exe -ArgumentList @('--selftest', '1', $out, $log) -Wait -PassThru
+          $code = $process.ExitCode
+
           if (Test-Path $log) { Get-Content $log -Encoding UTF8 | ForEach-Object { Write-Host $_ } }
+          Write-Host "--selftest exit code: $code"
+
           if ($code -eq 2) { Write-Host '::notice::no audio endpoint on this runner - capture tests skipped' }
           elseif ($code -ne 0) { throw "self test failed with exit code $code" }
 
