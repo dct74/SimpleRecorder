@@ -330,6 +330,11 @@ git push origin v1.0.1
 CI 日志里会打印构建产物的大小与 `sha256:`。注意：**Release 附件由 CI 构建**，与本地手工构建的哈希可能不同
 （编译器/工具集版本差异），因此以 CI 日志中的校验值为准。
 
+发布说明不是手写的：它来自 [`.github/release-notes.md`](https://github.com/dct74/SimpleRecorder/blob/main/.github/release-notes.md) 模板，
+CI 在发布时把 `{{VERSION}}`、`{{COMMIT}}`、`{{BUILD_DATE}}`、`{{SIZE}}`、`{{SHA256}}` 填好后作为 release notes 使用；
+若模板里残留未替换的 `{{...}}`，工作流会直接失败（防止写出带占位符的发布说明）。
+所以今后的发布说明格式统一，且附带**与附件完全对应的 SHA-256**。
+
 ## 6. 故障排查
 
 ### 录了几秒，却显示“时长 5 分多钟”、合并也很久

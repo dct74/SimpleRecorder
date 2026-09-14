@@ -83,6 +83,36 @@ jobs:
           path: ${{ steps.artifact.outputs.path }}
           if-no-files-found: error
 
+      # Renders .github/release-notes.md with the values that only exist after the
+      # build (size / checksum / commit).  A missing placeholder fails the job.
+      - name: Render the release notes
+        if: startsWith(github.ref, 'refs/tags/v')
+        id: notes
+        shell: pwsh
+        run: |
+          $template = '.github/release-notes.md'
+          if (-not (Test-Path $template)) { throw "$template is missing" }
+
+          $size = [long]'${{ steps.artifact.outputs.size }}'
+          $sha = '${{ steps.artifact.outputs.sha256 }}'
+          $commit = '${{ github.sha }}'
+
+          $notes = [System.IO.File]::ReadAllText($template, [System.Text.Encoding]::UTF8)
+          $notes = $notes.Replace('{{VERSION}}', $env:GITHUB_REF_NAME)
+          $notes = $notes.Replace('{{COMMIT}}', $commit.Substring(0, 7))
+          $notes = $notes.Replace('{{BUILD_DATE}}', (Get-Date).ToUniversalTime().ToString('yyyy-MM-dd'))
+          $notes = $notes.Replace('{{SIZE}}', ('{0:N0} 字节（{1:N0} KiB）' -f $size, ($size / 1KB)))
+          $notes = $notes.Replace('{{SHA256}}', $sha)
+
+          if ($notes -match '\{\{') {
+            throw "the rendered release notes still contain an unreplaced placeholder: $($Matches[0])"
+          }
+
+          $path = Join-Path $env:RUNNER_TEMP 'release-notes.rendered.md'
+          [System.IO.File]::WriteAllText($path, $notes, (New-Object System.Text.UTF8Encoding($false)))
+          "path=$path" >> $env:GITHUB_OUTPUT
+          Write-Host "rendered the release notes from $template"
+
       - name: Attach the executable to the release
         if: startsWith(github.ref, 'refs/tags/v')
         shell: pwsh
@@ -92,14 +122,16 @@ jobs:
         run: |
           $tag = $env:GITHUB_REF_NAME
           $exe = "${{ steps.artifact.outputs.path }}"
+          $notes = "${{ steps.notes.outputs.path }}"
 
           gh release view $tag *> $null
           if ($LASTEXITCODE -eq 0) {
-            Write-Host "release $tag already exists - replacing the asset"
+            Write-Host "release $tag already exists - replacing the asset and the notes"
             gh release upload $tag $exe --clobber
+            gh release edit $tag --notes-file $notes
           } else {
             Write-Host "creating release $tag"
-            $arguments = @($tag, $exe, '--title', $tag, '--generate-notes')
+            $arguments = @($tag, $exe, '--title', $tag, '--notes-file', $notes)
             if ($tag -match '-') {
               # e.g. v1.1.0-rc1: publish as pre-release so it does not become "Latest".
               Write-Host 'tag contains a suffix - marking the release as a pre-release'
