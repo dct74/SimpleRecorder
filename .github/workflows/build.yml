@@ -99,7 +99,13 @@ jobs:
             gh release upload $tag $exe --clobber
           } else {
             Write-Host "creating release $tag"
-            gh release create $tag $exe --title $tag --generate-notes
+            $arguments = @($tag, $exe, '--title', $tag, '--generate-notes')
+            if ($tag -match '-') {
+              # e.g. v1.1.0-rc1: publish as pre-release so it does not become "Latest".
+              Write-Host 'tag contains a suffix - marking the release as a pre-release'
+              $arguments += '--prerelease'
+            }
+            gh release create @arguments
           }
 
           Write-Host "attached sha256: $env:SHA256"
