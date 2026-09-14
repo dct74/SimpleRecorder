@@ -1,6 +1,10 @@
 # SimpleRecorder — 极简原生 Windows 录音工具（M4A）
 
-基于本仓库 `AudioCapture` 的采集原理重建的一个**只做三件事**的录音工具，输出统一为 **.m4a**（AAC）。
+参考上游 `AudioCapture` 项目的采集思路，独立实现的一个**只做三件事**的录音工具，输出统一为 **.m4a**（AAC）。
+代码为本仓库原创（MIT 许可），无任何第三方依赖。
+
+> **下载即用**：[Releases](https://github.com/dct74/SimpleRecorder/releases) 里下载 `SimpleRecorder.exe`（单文件、约 380 KB），
+> 拷到任意 Windows 10/11 x64 机器双击即可，无需安装、无需运行时。也可以自行编译（见第 4 节）。
 
 - 录制系统声音（单独）
 - 录制麦克风声音（单独）
@@ -206,7 +210,7 @@ cmake --build build
 
 也可用 Visual Studio 生成器：`cmake -S . -B build -G "Visual Studio 18 2026" -A x64`。
 
-## 3.5 部署：单文件，免安装，无第三方运行时
+## 5. 部署：单文件，免安装，无第三方运行时
 
 `package\SimpleRecorder.exe` 只有一个文件（约 350 KB），**直接拷贝到其他电脑就能跑，不需要安装任何东西**：
 
@@ -294,8 +298,7 @@ powershell -ExecutionPolicy Bypass -File tests\check-silence-warning.ps1
 
 | 脚本 | 作用 |
 | --- | --- |
-| `tests\verify-ui.ps1` | 界面回归（32 项：缩放/最小尺寸/按钮一致/状态机/保存对话框/退出清理） |
-| `tests\check-silence-warning.ps1` | 录制一段无声音的系统声，验证“全程没有声音”警告会出现 |
+| `tests\verify-ui.ps1` | 界面回归（32 项：缩放/最小尺寸/按钮一致/状态机/保存对话框/退出清理） || `tests\check-silence-warning.ps1` | 录制一段无声音的系统声，验证“全程没有声音”警告会出现 |
 | `tests\check-mixed-gui.ps1` | 真实混合录音端到端（时长准确性、无警告、回放切换、退出清理） |
 
 设置环境变量 `SIMPLERECORDER_TRACE=<文件路径>` 可以让程序输出布局量测（DPI、行高、标签文本宽度、
@@ -303,7 +306,7 @@ powershell -ExecutionPolicy Bypass -File tests\check-silence-warning.ps1
 
 ---
 
-## 5. 故障排查
+## 6. 故障排查
 
 ### 录了几秒，却显示“时长 5 分多钟”、合并也很久
 
@@ -349,13 +352,25 @@ SimpleRecorder.exe
 已修复：自检路径下 WASAPI/COM 接口的释放在 `CoUninitialize()` 之后发生，导致析构时访问已失效的接口指针。
 现在 `AudioCaptureEngine::Close()` 会在 `CoUninitialize()` 之前显式释放所有 COM 对象。
 
-## 6. 已知限制
+## 7. 已知限制
 
 1. **没有设备选择界面**：系统声音固定用默认输出设备，麦克风固定用默认输入设备（Windows 设置里改默认即可）。
 2. **混合时两路各自跟随自己的设备时钟**：系统声与麦克风可能由不同硬件时钟驱动，长时间录制会有极微小漂移（约 0.01%，1 小时约 0.3 秒）；合成时以较长的一路为准，短的一路末尾补静音。
-3. **相加采用单位增益**：两路同时接近满幅时会限幅（与仓库内原 `AudioMixer` 的策略一致），不做自动压缩。
+3. **相加采用单位增益**：两路同时接近满幅时会限幅（与本项目早期版本及上游 `AudioMixer` 的策略一致），不做自动压缩。
 4. **加 32 位整数 PCM 格式的设备**：转换分支已修复并有自检覆盖（旧版本对这类设备会算错样本数、读到缓冲区外），
    但本机没有该格式的真机可以实测，建议遇到时先用 `--selftest` 确认（日志会打印存储格式）。
-4. **回环采集不含"保护性静音"丢包之外的补偿**：若设备被独占、或采样率中途改变（`AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY`），只按时间戳补静音，不做重采样纠偏。
-5. **需要 Media Foundation 的 AAC 编码器**：精简版 Windows（N/KN 版）需要安装 Media Feature Pack；若初始化失败会给出明确提示。
-6. 提升权限的程序（以管理员运行的应用）其声音可能采集不到，除非本程序也以管理员运行。
+5. **回环采集不含"保护性静音"丢包之外的补偿**：若设备被独占、或采样率中途改变（`AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY`），只按时间戳补静音，不做重采样纠偏。
+6. **需要 Media Foundation 的 AAC 编码器**：精简版 Windows（N/KN 版）需要安装 Media Feature Pack；若初始化失败会给出明确提示。
+7. 提升权限的程序（以管理员运行的应用）其声音可能采集不到，除非本程序也以管理员运行。
+
+## 8. 许可（License）
+
+本项目采用 **MIT License**，全文见 [LICENSE](LICENSE)。
+
+```
+Copyright (c) 2026 dct74
+```
+
+本项目是针对同一类需求的独立实现：设计思路参考了上游 `AudioCapture` 项目公开的做法
+（WASAPI 回环/输入采集、Media Foundation 的 AAC 与 MPEG-4 管线），本仓库全部代码为原创编写，
+不含上游代码；如果你要二次发布，请遵守本仓库的 MIT 条款。
