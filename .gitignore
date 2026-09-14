@@ -1,0 +1,19 @@
+# Build output
+build/
+package/
+*.exe
+*.dll
+*.lib
+*.obj
+
+# Test / recording artefacts
+*.wav
+*.m4a
+*.mp3
+*.opus
+*.flac
+*.log
+
+# Keep the DPI + Common Controls manifest: some global gitignore files
+# (e.g. a machine-wide "*.manifest") would otherwise drop it and break the build.
+!app.manifest
