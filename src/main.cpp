@@ -1928,8 +1928,7 @@ int RunSelfTest(const std::wstring& outputDir, const std::wstring& logPath, int 
     if (systemReady || micReady)
     {
             // pump messages while recording so that any COM callbacks can run
-            const ULONGLONG until = GetTickCount64() + static_cast<ULONGLONG>(seconds) * 1000;
-            while (GetTickCount64() < until)
+            const ULONGLONG until = GetTickCount64() + static_cast<ULONGLONG>(seconds) * 1000;            while (GetTickCount64() < until)
             {
                 MSG message{};
                 while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE))
@@ -2090,6 +2089,23 @@ int RunSelfTest(const std::wstring& outputDir, const std::wstring& logPath, int 
             allGood = allGood && attempts > 0 && context.playbackEnded && writerOk;
             context.Log(allGood ? L"结果: PASS" : L"结果: FAIL");
             exitCode = allGood ? 0 : 1;
+    }
+    else if (!systemOpened && !micOpened)
+    {
+        // Headless machines / CI runners have no audio endpoints.  The capture,
+        // mixing and playback parts cannot be exercised, but the writer tests
+        // above still ran, so report a distinct "skipped" code instead of a
+        // failure (0 = PASS, 2 = skipped, 1 = FAIL).
+        context.Log(L"本机没有可用音频设备（默认输出/输入端点都不存在）：跳过采集、合成与回放部分");
+        context.Log(writerOk ? L"结果: SKIPPED (no audio devices)"
+                             : L"结果: FAIL");
+        exitCode = writerOk ? 2 : 1;
+    }
+    else
+    {
+        context.Log(L"音频设备存在但无法启动采集：采集、合成与回放部分已跳过");
+        context.Log(L"结果: FAIL");
+        exitCode = 1;
     }
 
     if (context.window != nullptr)

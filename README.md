@@ -190,7 +190,6 @@ SimpleRecorder/
 ---
 
 ## 4. 构建
-
 需要：Visual Studio 2019+（含 C++ 桌面开发）、Windows SDK 10.0.19041+、CMake 3.15+。
 **不需要 vcpkg，不需要任何第三方包。**
 
@@ -242,6 +241,9 @@ cmake --build build
 ### 自检模式（命令行）
 
 用于在无人值守环境下验证"采集 → 转码 → 混合 → 回放"整条链路：
+
+退出码：**0 = 全部通过**；**2 = 写入器自检通过，但本机没有音频端点（采集/合成/回放跳过）**；**1 = 失败**。
+因此它可以在无音频设备的机器（包括 CI runner）上运行，至少验证格式转换与编码链路。
 
 ```cmd
 SimpleRecorder.exe --selftest <秒数> <输出目录> <日志文件>
@@ -305,6 +307,28 @@ powershell -ExecutionPolicy Bypass -File tests\check-silence-warning.ps1
 最小尺寸）与 `MfAudio` 各阶段跟踪日志，便于排查显示或编码问题。
 
 ---
+
+### 自动构建与发布（GitHub Actions）
+
+`.github/workflows/build.yml`：
+
+| 触发 | 行为 |
+| --- | --- |
+| push 到 `main` / Pull Request / 手动触发 | 在 `windows-latest` 上用 MSVC 配置并编译（Release）→ 跑 `--selftest`（runner 无音频端点时按“跳过”处理）→ 把 exe 作为构建产物上传 |
+| push 形如 `v*` 的 tag | 在以上基础上，把编译出的 `SimpleRecorder.exe` 上传（或替换）到该 tag 的 Release |
+
+所以发布新版本的流程就是：
+
+```powershell
+cd <你的仓库工作副本>
+# 1) 改代码 → 本地构建 + 跑 tests → git commit → git push origin main
+# 2) 打 tag 并推送，CI 会自动编译并把附件挂到对应的 Release
+git tag v1.0.1
+git push origin v1.0.1
+```
+
+CI 日志里会打印构建产物的大小与 `sha256:`。注意：**Release 附件由 CI 构建**，与本地手工构建的哈希可能不同
+（编译器/工具集版本差异），因此以 CI 日志中的校验值为准。
 
 ## 6. 故障排查
 
