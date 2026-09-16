@@ -15,6 +15,11 @@ struct InputFile
     std::wstring path;
     // QPC timestamp (100 ns units) of frame 0 of the file; 0 when unknown.
     unsigned long long startQpc = 0;
+    // Clock rate of the device that recorded this route, in samples per second as
+    // measured during capture (0 = not measured).  When every route reports one,
+    // the mixer resamples the routes onto the first route's clock so that two
+    // independently clocked devices stay aligned over long recordings.
+    double measuredSampleRate = 0.0;
 };
 
 struct MixResult
@@ -23,6 +28,8 @@ struct MixResult
     UINT64 inputFrames = 0;
     UINT32 sampleRate = 0;
     UINT32 channels = 0;
+    // Clock correction that was applied, in parts per million (0 = none needed).
+    double clockCorrectionPpm = 0.0;
 };
 
 // Turns one or more PCM WAV files into a single .m4a file using the Windows

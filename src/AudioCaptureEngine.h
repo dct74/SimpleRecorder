@@ -48,6 +48,11 @@ public:
     // plausible (the recorded timeline may never run ahead of the wall clock).
     UINT64 DroppedFrames() const { return m_droppedFrames; }
 
+    // Measured clock rate of this route in samples per second (0 = not measured).
+    // Two routes clocked by different devices drift apart by a few ppm, which the
+    // mixer compensates with this value.  Valid after Stop().
+    double MeasuredSampleRate() const { return m_measuredRate; }
+
     // Signal level of this route; a valid peak of 0 means the whole route was
     // digital silence (muted device, wrong device, or nothing playing).
     bool PeakLevelValid() const { return m_writer.PeakLevelValid(); }
@@ -94,4 +99,13 @@ private:
     UINT64 m_startTicks = 0;      // our own counter when the stream was started
     UINT64 m_qpcFrequency = 1;    // QueryPerformanceFrequency at start
     UINT64 m_droppedFrames = 0;   // silence refused because it was not plausible
+
+    // Clock probe: compares how many frames a route delivered with the device
+    // time stamps that carried them.  Pairs separated by a gap we synthesised are
+    // skipped, because invented silence carries no clock information.
+    UINT64 m_probeFrames = 0;     // audio frames across contiguous packet pairs
+    UINT64 m_probeQpc = 0;        // device time stamps spanned by those frames
+    UINT64 m_probePrevQpc = 0;    // device time stamp of the previous packet
+    UINT64 m_probePrevFrames = 0; // captured frames before that packet
+    double m_measuredRate = 0.0;  // samples per second, filled in by Stop()
 };

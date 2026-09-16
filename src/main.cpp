@@ -74,7 +74,7 @@ const wchar_t* const kModeLabels[3] = {
 // Longest text the status box can ever show (used to derive the minimum height).
 const wchar_t* const kWorstCaseStatusText =
     L"✔ 录音完成：混合录制（系统声音 + 麦克风）（尚未保存）\n"
-    L"时长 00:00:00，文件大小 999.99 MB\n"
+    L"时长 00:00:00，文件大小 999.99 MB，已补偿两路时钟差 0.0500%（约 1.80 秒/小时）\n"
     L"临时文件：%TEMP%\\SimpleRecorder\\rec-20260914-235959-999\\result.m4a（退出时删除）\n"
     L"⚠ 录音设备返回了异常时间戳，已按真实录制时长忽略 999.9 秒静音\n"
     L"⚠ 麦克风轨全程没有声音（检查是否被静音／选错设备／静音键）\n"
@@ -114,6 +114,7 @@ std::unique_ptr<AudioCaptureEngine> g_micEngine;
 std::wstring g_sessionDir;
 std::wstring g_resultPath;
 std::wstring g_captureNote; // shown in the status when the device timestamps were odd
+double g_clockCorrectionPpm = 0.0; // applied clock-drift correction of the last mix
 ULONGLONG g_recordStartTick = 0;
 UINT64 g_resultDurationMs = 0;
 int g_lastMode = 2;
@@ -123,6 +124,7 @@ std::thread g_worker;
 std::mutex g_workerMutex;
 bool g_workerSucceeded = false;
 std::wstring g_workerError;
+double g_workerClockPpm = 0.0;
 
 MediaPlayer* g_player = nullptr; // process lifetime, see CreateMediaPlayer()
 
@@ -186,6 +188,20 @@ std::wstring FormatFileSize(UINT64 bytes)
     }
     wchar_t buffer[64];
     swprintf_s(buffer, L"%.2f %s", size, units[unit]);
+    return buffer;
+}
+
+// Describes an applied clock-drift correction, e.g. "已补偿两路时钟差 0.0100%（约 0.36 秒/小时）".
+std::wstring FormatClockCorrection(double ppm)
+{
+    if (std::fabs(ppm) < 1.0)
+    {
+        return std::wstring();
+    }
+
+    wchar_t buffer[128];
+    swprintf_s(buffer, L"已补偿两路时钟差 %.4f%%（约 %.2f 秒/小时）", ppm / 10000.0,
+               ppm * 3600.0 / 1e6);
     return buffer;
 }
 
@@ -780,6 +796,12 @@ void UpdateStatusText()
         text += FormatDuration(g_resultDurationMs);
         text += L"，文件大小 ";
         text += FormatFileSize(fileSize);
+        const std::wstring correction = FormatClockCorrection(g_clockCorrectionPpm);
+        if (!correction.empty())
+        {
+            text += L"，";
+            text += correction;
+        }
         if (!g_resultSaved)
         {
             text += L"\n临时文件：";
@@ -879,11 +901,13 @@ void StartRecording()
         }
     }
 
+    // Always reset per-recording state before touching anything else.
     StopPlayback();
     CleanupSession();
     ReleaseEngines();
     g_resultSaved = false;
     g_captureNote.clear();
+    g_clockCorrectionPpm = 0.0;
 
     const int mode = CurrentMode();
     const bool wantSystem = (mode == 0 || mode == 2);
@@ -946,12 +970,14 @@ void StopRecording()
     if (g_systemEngine)
     {
         g_systemEngine->Stop();
-        inputs.push_back({g_systemEngine->TempWavPath(), g_systemEngine->BaseQpc()});
+        inputs.push_back({g_systemEngine->TempWavPath(), g_systemEngine->BaseQpc(),
+                          g_systemEngine->MeasuredSampleRate()});
     }
     if (g_micEngine)
     {
         g_micEngine->Stop();
-        inputs.push_back({g_micEngine->TempWavPath(), g_micEngine->BaseQpc()});
+        inputs.push_back({g_micEngine->TempWavPath(), g_micEngine->BaseQpc(),
+                          g_micEngine->MeasuredSampleRate()});
     }
 
     const std::wstring outputPath = g_sessionDir + L"\\result.m4a";
@@ -960,6 +986,7 @@ void StopRecording()
         std::lock_guard<std::mutex> lock(g_workerMutex);
         g_workerSucceeded = false;
         g_workerError.clear();
+        g_workerClockPpm = 0.0;
     }
 
     g_worker = std::thread([inputs, outputPath]() {
@@ -978,6 +1005,7 @@ void StopRecording()
             g_workerSucceeded = ok;
             g_workerError = error;
             g_resultDurationMs = result.durationMs;
+            g_workerClockPpm = result.clockCorrectionPpm;
         }
 
         PostMessageW(g_window, WM_APP_PROCESS_DONE, 0, 0);
@@ -997,6 +1025,7 @@ void OnProcessDone()
         std::lock_guard<std::mutex> lock(g_workerMutex);
         succeeded = g_workerSucceeded;
         error = g_workerError;
+        g_clockCorrectionPpm = g_workerClockPpm;
     }
 
     if (succeeded)
@@ -1662,11 +1691,16 @@ bool RunWriterSelfTest(SelfTestContext& context, const std::wstring& outputDir)
 // returns the peak absolute 16-bit sample value.  Used by the self test to prove
 // that the encoded files actually contain the recorded signal (a file can have
 // the right size, the right duration and still be silent).
-UINT32 DecodedPeakLevel(const std::wstring& path, UINT64* framesOut = nullptr)
+UINT32 DecodedPeakLevel(const std::wstring& path, UINT64* framesOut = nullptr,
+                        std::vector<int16_t>* samplesOut = nullptr)
 {
     if (framesOut != nullptr)
     {
         *framesOut = 0;
+    }
+    if (samplesOut != nullptr)
+    {
+        samplesOut->clear();
     }
 
     IMFAttributes* attributes = nullptr;
@@ -1755,6 +1789,10 @@ UINT32 DecodedPeakLevel(const std::wstring& path, UINT64* framesOut = nullptr)
                         peak = static_cast<UINT32>(value);
                     }
                 }
+                if (samplesOut != nullptr)
+                {
+                    samplesOut->insert(samplesOut->end(), samples, samples + count);
+                }
                 frames += length / blockAlign;
                 buffer->Unlock();
             }
@@ -1823,6 +1861,168 @@ bool WriteSyntheticWav(const std::wstring& path, UINT32 sampleRate, UINT16 chann
     return true;
 }
 
+// Writes a 16-bit PCM test tone that stays silent except for one short burst.
+// Used to check that the mixer keeps two routes aligned in time: the burst of the
+// second route sits at a deliberately drifted frame position, so the mix is only
+// correct if the clock correction moved it onto the first route's burst.
+bool WriteBurstWav(const std::wstring& path, UINT32 sampleRate, UINT32 totalFrames,
+                   UINT32 burstFrame, UINT32 burstFrames, int16_t amplitude)
+{
+    WAVEFORMATEX format{};
+    format.wFormatTag = WAVE_FORMAT_PCM;
+    format.nChannels = 1;
+    format.nSamplesPerSec = sampleRate;
+    format.wBitsPerSample = 16;
+    format.nBlockAlign = 2;
+    format.nAvgBytesPerSec = sampleRate * 2;
+
+    WavWriter writer;
+    if (!writer.Open(path, &format))
+    {
+        return false;
+    }
+
+    std::vector<int16_t> silence(4096, 0);
+    std::vector<int16_t> burst(burstFrames);
+    for (UINT32 index = 0; index < burstFrames; ++index)
+    {
+        const double phase = 2.0 * 3.14159265358979 * 1000.0 * index / sampleRate;
+        burst[index] = static_cast<int16_t>(amplitude * std::sin(phase));
+    }
+
+    UINT32 frame = 0;
+    while (frame < totalFrames)
+    {
+        const UINT32 burstEnd = std::min(burstFrame + burstFrames, totalFrames);
+        if (frame < burstFrame)
+        {
+            const UINT32 count = std::min<UINT32>(burstFrame - frame,
+                                                 static_cast<UINT32>(silence.size()));
+            writer.Write(reinterpret_cast<const BYTE*>(silence.data()), count * 2);
+            frame += count;
+        }
+        else if (frame < burstEnd)
+        {
+            const UINT32 count = burstEnd - frame;
+            writer.Write(reinterpret_cast<const BYTE*>(burst.data() + (frame - burstFrame)),
+                         count * 2);
+            frame += count;
+        }
+        else
+        {
+            const UINT32 count = std::min<UINT32>(totalFrames - frame,
+                                                 static_cast<UINT32>(silence.size()));
+            writer.Write(reinterpret_cast<const BYTE*>(silence.data()), count * 2);
+            frame += count;
+        }
+    }
+
+    const bool writeError = writer.HasWriteError();
+    writer.Close();
+    return !writeError;
+}
+
+// Peak level in a decoded (interleaved, 'channels' wide) buffer around a frame.
+UINT32 PeakNearFrame(const std::vector<int16_t>& samples, UINT32 channels, UINT32 frame,
+                     UINT32 window)
+{
+    UINT32 peak = 0;
+    const UINT32 first = frame > window ? frame - window : 0;
+    const UINT32 last = frame + window;
+    for (UINT32 index = first; index < last; ++index)
+    {
+        const size_t base = static_cast<size_t>(index) * channels;
+        for (UINT32 channel = 0; channel < channels && base + channel < samples.size(); ++channel)
+        {
+            const int value = samples[base + channel];
+            const int magnitude = value < 0 ? -value : value;
+            if (magnitude > static_cast<int>(peak))
+            {
+                peak = static_cast<UINT32>(magnitude);
+            }
+        }
+    }
+    return peak;
+}
+
+// Deterministic check of the clock drift compensation.  Needs no audio device, so
+// it also runs on CI runners.  Route B is written as if its device ran 2000 ppm
+// (0.2%, far beyond any real crystal, chosen so the two marks stay clearly apart)
+// fast, so its marker sits 5280 frames later in its own file: exactly where that
+// device would have put the same real-world instant.  Aligned mixing must make
+// both markers add up on one frame; without the correction they stay apart.
+bool RunDriftSelfTest(SelfTestContext& context, const std::wstring& outputDir)
+{
+    const UINT32 rate = 48000;
+    const UINT32 totalFrames = rate * 60;      // 60 s of audio
+    const UINT32 burstFrame = rate * 55;       // marker at 55 s of real time
+    const UINT32 burstFrames = rate / 20;      // 50 ms
+    const int16_t amplitude = 6000;
+    const double drift = 1.002;                // 2000 ppm
+    const UINT32 burstFrameDrifted = static_cast<UINT32>(burstFrame * drift);
+    const UINT32 single = static_cast<UINT32>(amplitude);
+
+    const std::wstring routeA = outputDir + L"\\drift_a.wav";
+    const std::wstring routeB = outputDir + L"\\drift_b.wav";
+    const std::wstring correctedM4a = outputDir + L"\\drift_corrected.m4a";
+    const std::wstring controlM4a = outputDir + L"\\drift_control.m4a";
+
+    DeleteFileW(routeA.c_str());
+    DeleteFileW(routeB.c_str());
+    DeleteFileW(correctedM4a.c_str());
+    DeleteFileW(controlM4a.c_str());
+
+    if (!WriteBurstWav(routeA, rate, totalFrames, burstFrame, burstFrames, amplitude) ||
+        !WriteBurstWav(routeB, rate, totalFrames, burstFrameDrifted, burstFrames, amplitude))
+    {
+        context.Log(L"漂移补偿自检: 无法生成测试输入");
+        return false;
+    }
+
+    const double nominal = static_cast<double>(rate);
+    bool allOk = true;
+
+    auto runCase = [&](const wchar_t* label, const std::wstring& output, double rateA, double rateB,
+                       bool expectAligned) {
+        std::vector<mfaudio::InputFile> inputs = {{routeA, 1000000ULL, rateA},
+                                                  {routeB, 1000000ULL, rateB}};
+        mfaudio::MixResult mixResult;
+        std::wstring error;
+        const bool mixed = mfaudio::MixToM4a(inputs, output, kAacBitrate, error, &mixResult);
+
+        // Offset independent analysis: only the *level* of the markers matters,
+        // so a constant encoder delay cannot influence the result.  Two markers
+        // landing on the same frame add up to roughly twice the amplitude of one.
+        std::vector<int16_t> samples;
+        UINT64 decodedFrames = 0;
+        const UINT32 peak = mixed ? DecodedPeakLevel(output, &decodedFrames, &samples) : 0;
+
+        const double ppm = mixResult.clockCorrectionPpm;
+        const bool levelOk = expectAligned
+            ? (peak > single * 3 / 2)
+            : (peak > single / 2 && peak < single * 3 / 2);
+        const bool ppmOk = expectAligned ? (std::fabs(ppm - (drift - 1.0) * 1e6) < 20.0)
+                                         : (std::fabs(ppm) < 1.0);
+
+        const bool ok = mixed && levelOk && ppmOk;
+        if (!ok)
+        {
+            allOk = false;
+        }
+
+        context.Log(std::wstring(L"漂移自检 ") + label + L": " + (ok ? L"ok" : L"失败") +
+                    L" (峰值 " + std::to_wstring(peak) + L"/单路 " + std::to_wstring(single) +
+                    L"，解码 " + std::to_wstring(decodedFrames) + L" frames，补偿 " +
+                    std::to_wstring(ppm) + L" ppm)" +
+                    (error.empty() ? std::wstring() : (L"  错误: " + error)));
+    };
+
+    runCase(L"声明时钟差 2000 ppm（应补偿并对齐）", correctedM4a, nominal, nominal * drift, true);
+    runCase(L"声明时钟相同（不补偿，两个标记各自独立）", controlM4a, nominal, nominal, false);
+
+    return allOk;
+}
+
 int RunSelfTest(const std::wstring& outputDir, const std::wstring& logPath, int seconds)
 {
     SelfTestContext context;
@@ -1849,6 +2049,7 @@ int RunSelfTest(const std::wstring& outputDir, const std::wstring& logPath, int 
     context.Log(std::wstring(L"MFStartup: ") + (mfOk ? L"ok" : L"failed"));
 
     bool writerOk = RunWriterSelfTest(context, outputDir);
+    const bool driftOk = RunDriftSelfTest(context, outputDir);
 
     // hidden window for MFPlay
     WNDCLASSEXW windowClass{};
@@ -2021,7 +2222,8 @@ int RunSelfTest(const std::wstring& outputDir, const std::wstring& logPath, int 
                             std::to_wstring(bytes) + L" 字节, 解码后 " +
                             std::to_wstring(decodedFrames) + L" frames, 峰值 " +
                             std::to_wstring(peak) + L" (源峰值 " +
-                            std::to_wstring(sourcePeak) + L"))" +
+                            std::to_wstring(sourcePeak) + L"), 时钟补偿 " +
+                            std::to_wstring(mixResult.clockCorrectionPpm) + L" ppm)" +
                             (localError.empty() ? std::wstring() : (L"  错误: " + localError)));
 
                 // When a source carried a signal, the encoded file must carry it
@@ -2086,7 +2288,7 @@ int RunSelfTest(const std::wstring& outputDir, const std::wstring& logPath, int 
                 player.Shutdown();
             }
 
-            allGood = allGood && attempts > 0 && context.playbackEnded && writerOk;
+            allGood = allGood && attempts > 0 && context.playbackEnded && writerOk && driftOk;
             context.Log(allGood ? L"结果: PASS" : L"结果: FAIL");
             exitCode = allGood ? 0 : 1;
     }
@@ -2099,7 +2301,7 @@ int RunSelfTest(const std::wstring& outputDir, const std::wstring& logPath, int 
         context.Log(L"本机没有可用音频设备（默认输出/输入端点都不存在）：跳过采集、合成与回放部分");
         context.Log(writerOk ? L"结果: SKIPPED (no audio devices)"
                              : L"结果: FAIL");
-        exitCode = writerOk ? 2 : 1;
+        exitCode = writerOk && driftOk ? 2 : 1;
     }
     else
     {

@@ -6,6 +6,7 @@
 #include <mfreadwrite.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <memory>
@@ -92,6 +93,13 @@ struct Track
     size_t cursor = 0;
     UINT64 padFrames = 0; // leading silence (alignment offset)
     UINT32 blockAlign = 4;
+    UINT32 channels = 2;
+    UINT32 nativeRate = 0; // rate the file claims, before resampling
+    // Clock drift correction: input frames consumed per output frame.  1.0 keeps
+    // the exact frame-for-frame behaviour; anything else resamples this route so
+    // that it follows the reference route's clock.
+    double step = 1.0;
+    double position = 0.0; // fractional read position, see ConsumeTrackFrames()
 
     ~Track()
     {
@@ -104,6 +112,14 @@ struct Track
     UINT32 PendingFrames() const
     {
         return blockAlign == 0 ? 0 : static_cast<UINT32>((pending.size() - cursor) / blockAlign);
+    }
+
+    // Frames still in front of the read position (alignment padding included).
+    UINT64 RemainingInputFrames() const
+    {
+        const UINT64 input = padFrames + PendingFrames();
+        const UINT64 passed = static_cast<UINT64>(position);
+        return input > passed ? (input - passed) : 0;
     }
 };
 
@@ -236,6 +252,112 @@ void ReadTrackFrames(Track& track, UINT32 frames, int16_t* destination, UINT32 c
             destination[static_cast<size_t>(frame) * channels + channel] = 0;
         }
     }
+}
+
+// Value of one channel at an absolute frame index inside the track: alignment
+// padding and everything past the end of the stream count as silence.
+int TrackSample(const Track& track, UINT64 index, UINT32 channel)
+{
+    if (index < track.padFrames)
+    {
+        return 0;
+    }
+
+    const UINT64 offset = index - track.padFrames;
+    const UINT64 available = track.blockAlign == 0
+        ? 0
+        : static_cast<UINT64>(track.pending.size() - track.cursor) / track.blockAlign;
+    if (offset >= available)
+    {
+        return 0;
+    }
+
+    const int16_t* samples =
+        reinterpret_cast<const int16_t*>(track.pending.data() + track.cursor);
+    return samples[offset * track.channels + channel];
+}
+
+// Drops the input frames that are completely behind the read position, keeping
+// the fractional remainder (and with it the interpolation neighbour).
+void ConsumeTrackFrames(Track& track)
+{
+    const UINT64 whole = static_cast<UINT64>(track.position);
+    if (whole == 0)
+    {
+        return;
+    }
+
+    if (whole <= track.padFrames)
+    {
+        track.padFrames -= whole;
+    }
+    else
+    {
+        UINT64 dataFrames = whole - track.padFrames;
+        track.padFrames = 0;
+
+        const UINT64 available = track.blockAlign == 0
+            ? 0
+            : static_cast<UINT64>(track.pending.size() - track.cursor) / track.blockAlign;
+        if (dataFrames > available)
+        {
+            dataFrames = available;
+        }
+        track.cursor += static_cast<size_t>(dataFrames) * track.blockAlign;
+    }
+
+    track.position -= static_cast<double>(whole);
+}
+
+// Reads 'frames' output frames, consuming about frames * step input frames and
+// interpolating in between.  The step stays within ~0.1% of 1.0, so linear
+// interpolation is transparent.
+void ReadTrackFramesResampled(Track& track, UINT32 frames, int16_t* destination, UINT32 channels)
+{
+    for (UINT32 output = 0; output < frames; ++output)
+    {
+        const UINT64 index = static_cast<UINT64>(track.position);
+        const double fraction = track.position - static_cast<double>(index);
+
+        for (UINT32 channel = 0; channel < channels; ++channel)
+        {
+            const int low = TrackSample(track, index, channel);
+            const int high = TrackSample(track, index + 1, channel);
+            destination[static_cast<size_t>(output) * channels + channel] =
+                static_cast<int16_t>(low + static_cast<int>((high - low) * fraction));
+        }
+
+        track.position += track.step;
+    }
+
+    ConsumeTrackFrames(track);
+}
+
+// How many output frames the track can supply right now.
+UINT32 AvailableOutputFrames(const Track& track)
+{
+    if (track.step == 1.0)
+    {
+        const UINT64 input = track.padFrames + track.PendingFrames();
+        return track.endOfStream
+            ? kChunkFrames
+            : static_cast<UINT32>(std::min<UINT64>(input, kChunkFrames));
+    }
+
+    if (track.endOfStream)
+    {
+        // Past the end every sample reads as silence, so output is unlimited.
+        return kChunkFrames;
+    }
+
+    const double remaining =
+        static_cast<double>(track.padFrames + track.PendingFrames()) - 1.0 - track.position;
+    if (remaining <= 0.0)
+    {
+        return 0;
+    }
+
+    return std::min(static_cast<UINT32>(remaining / track.step) + 1, kChunkFrames);
 }
 
 HRESULT CreateSinkWriter(const std::wstring& path,
@@ -377,6 +499,7 @@ bool MixToM4a(const std::vector<InputFile>& inputs,
             firstChannels = channels;
         }
 
+        track->nativeRate = rate;
         tracks.push_back(std::move(track));
     }
 
@@ -420,6 +543,7 @@ bool MixToM4a(const std::vector<InputFile>& inputs,
         }
 
         tracks[index]->blockAlign = blockAlign;
+        tracks[index]->channels = channels;
     }
     Trace(L"canonical format " + std::to_wstring(sampleRate) + L" Hz / " +
           std::to_wstring(channels) + L" ch");
@@ -444,6 +568,55 @@ bool MixToM4a(const std::vector<InputFile>& inputs,
                 pad = std::min<UINT64>(pad, static_cast<UINT64>(sampleRate) * 5); // sanity: 5 s
                 tracks[index]->padFrames = pad;
             }
+        }
+    }
+
+    // ------------------------------------------------- clock drift correction
+    // Two routes are almost always clocked by different devices whose real sample
+    // rates differ by a few ppm.  Aligning only the start would leave an offset
+    // that grows linearly (0.1-0.7 s per hour is realistic), so each route is
+    // resampled onto the first route's clock using the rates measured while
+    // capturing.  Without trustworthy measurements nothing changes: every step
+    // stays 1.0 and the mixer takes the exact frame-for-frame path.
+    double clockCorrectionPpm = 0.0;
+    if (tracks.size() > 1 && inputs[0].measuredSampleRate > 0.0 && tracks[0]->nativeRate > 0)
+    {
+        const double referenceRatio =
+            inputs[0].measuredSampleRate / static_cast<double>(tracks[0]->nativeRate);
+
+        for (size_t index = 1; index < tracks.size(); ++index)
+        {
+            if (inputs[index].measuredSampleRate <= 0.0 || tracks[index]->nativeRate == 0)
+            {
+                continue;
+            }
+
+            const double ratio =
+                inputs[index].measuredSampleRate / static_cast<double>(tracks[index]->nativeRate);
+            const double step = ratio / referenceRatio;
+            const double ppm = (step - 1.0) * 1e6;
+
+            if (std::fabs(ppm) > 5000.0)
+            {
+                Trace(L"clock correction ignored for track " + std::to_wstring(index) +
+                      L": implausible " + std::to_wstring(ppm) + L" ppm");
+                continue;
+            }
+            if (std::fabs(ppm) < 1.0)
+            {
+                continue; // below 1 ppm there is nothing worth resampling
+            }
+
+            tracks[index]->step = step;
+            if (std::fabs(ppm) > std::fabs(clockCorrectionPpm))
+            {
+                clockCorrectionPpm = ppm;
+            }
+
+            Trace(L"clock correction for track " + std::to_wstring(index) + L": " +
+                  std::to_wstring(inputs[index].measuredSampleRate) + L" Hz measured, " +
+                  std::to_wstring(tracks[index]->nativeRate) + L" Hz nominal, step=" +
+                  std::to_wstring(step) + L" (" + std::to_wstring(ppm) + L" ppm)");
         }
     }
 
@@ -577,13 +750,18 @@ bool MixToM4a(const std::vector<InputFile>& inputs,
         {
             if (!track->endOfStream)
             {
-                if (!EnsurePending(*track, kChunkFrames))
+                // Resampling consumes slightly more (or less) input than it
+                // produces, so buffer a little extra for a whole chunk.
+                const UINT32 ensureFrames = track->step == 1.0
+                    ? kChunkFrames
+                    : static_cast<UINT32>(std::ceil(kChunkFrames * track->step)) + 2;
+                if (!EnsurePending(*track, ensureFrames))
                 {
                     ok = false;
                     break;
                 }
             }
-            if (!track->endOfStream || track->PendingFrames() > 0 || track->padFrames > 0)
+            if (!track->endOfStream || track->RemainingInputFrames() > 0)
             {
                 anyWork = true;
             }
@@ -597,11 +775,7 @@ bool MixToM4a(const std::vector<InputFile>& inputs,
         UINT32 frames = kChunkFrames;
         for (auto& track : tracks)
         {
-            const UINT32 available = track->endOfStream
-                ? kChunkFrames
-                : static_cast<UINT32>(std::min<UINT64>(
-                      static_cast<UINT64>(track->padFrames) + track->PendingFrames(), kChunkFrames));
-            frames = std::min(frames, available);
+            frames = std::min(frames, AvailableOutputFrames(*track));
         }
 
         if (frames == 0)
@@ -614,7 +788,15 @@ bool MixToM4a(const std::vector<InputFile>& inputs,
 
         for (auto& track : tracks)
         {
-            ReadTrackFrames(*track, frames, scratch.data(), channels);
+            if (track->step == 1.0)
+            {
+                ReadTrackFrames(*track, frames, scratch.data(), channels);
+            }
+            else
+            {
+                ReadTrackFramesResampled(*track, frames, scratch.data(), channels);
+            }
+
             for (size_t i = 0; i < sampleCount; ++i)
             {
                 accumulator[i] = static_cast<int16_t>(
@@ -708,6 +890,7 @@ bool MixToM4a(const std::vector<InputFile>& inputs,
         result->sampleRate = sampleRate;
         result->channels = channels;
         result->durationMs = framesWritten * 1000ULL / sampleRate;
+        result->clockCorrectionPpm = clockCorrectionPpm;
     }
 
     return true;

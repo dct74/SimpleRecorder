@@ -203,6 +203,11 @@ bool AudioCaptureEngine::Start(std::wstring& error)
     m_startTicks = static_cast<UINT64>(counter.QuadPart);
     m_qpcFrequency = static_cast<UINT64>(frequency.QuadPart != 0 ? frequency.QuadPart : 1);
     m_droppedFrames = 0;
+    m_probeFrames = 0;
+    m_probeQpc = 0;
+    m_probePrevQpc = 0;
+    m_probePrevFrames = 0;
+    m_measuredRate = 0.0;
 
     Trace(L"capture start: qpcFrequency=" + std::to_wstring(frequency.QuadPart) +
           L" rawTicks=" + std::to_wstring(counter.QuadPart) + L" baseQpc(100ns)=" +
@@ -255,6 +260,25 @@ void AudioCaptureEngine::Stop()
         }
     }
 
+    // Effective device rate: how many frames this route delivered per second of
+    // device time.  Only a long enough span is trusted and absurd results are
+    // discarded, so short recordings keep the plain frame-for-frame mix.
+    if (m_probeQpc > 0 && m_waveFormat != nullptr && m_waveFormat->nSamplesPerSec > 0)
+    {
+        const double seconds = static_cast<double>(m_probeQpc) / 10000000.0;
+        const double nominal = static_cast<double>(m_waveFormat->nSamplesPerSec);
+        const double rate = static_cast<double>(m_probeFrames) / seconds;
+        if (seconds >= 30.0 && rate > nominal * 0.99 && rate < nominal * 1.01)
+        {
+            m_measuredRate = rate;
+        }
+
+        Trace(L"clock probe: frames=" + std::to_wstring(m_probeFrames) + L" seconds=" +
+              std::to_wstring(seconds) + L" measuredRate=" + std::to_wstring(rate) +
+              L" nominal=" + std::to_wstring(m_waveFormat->nSamplesPerSec) + L" accepted=" +
+              std::to_wstring(m_measuredRate));
+    }
+
     m_writer.Close();
 }
 
@@ -280,6 +304,7 @@ void AudioCaptureEngine::ConsumePacket(BYTE* data, UINT32 frames, DWORD flags, U
 {
     const UINT32 blockAlign = m_waveFormat->nBlockAlign;
     const UINT32 sampleRate = m_waveFormat->nSamplesPerSec;
+    UINT64 insertedGap = 0;
 
     // Keep the timeline continuous: if the packet starts later than expected,
     // the difference was silence.
@@ -325,12 +350,25 @@ void AudioCaptureEngine::ConsumePacket(BYTE* data, UINT32 frames, DWORD flags, U
             {
                 m_writer.WriteSilenceFrames(gapFrames);
                 m_timelineFrames += gapFrames;
+                insertedGap = gapFrames;
             }
         }
     }
 
     if (frames > 0)
     {
+        const UINT64 framesBefore = m_framesCaptured;
+
+        // Clock probe: only contiguous packets tell us how fast this device runs
+        // relative to its own time stamps.
+        if (insertedGap == 0 && m_probePrevQpc != 0 && qpc > m_probePrevQpc)
+        {
+            m_probeFrames += framesBefore - m_probePrevFrames;
+            m_probeQpc += qpc - m_probePrevQpc;
+        }
+        m_probePrevQpc = qpc;
+        m_probePrevFrames = framesBefore;
+
         if ((flags & AUDCLNT_BUFFERFLAGS_SILENT) != 0 || data == nullptr)
         {
             m_writer.WriteSilenceFrames(frames);
