@@ -1922,29 +1922,6 @@ bool WriteBurstWav(const std::wstring& path, UINT32 sampleRate, UINT32 totalFram
     return !writeError;
 }
 
-// Peak level in a decoded (interleaved, 'channels' wide) buffer around a frame.
-UINT32 PeakNearFrame(const std::vector<int16_t>& samples, UINT32 channels, UINT32 frame,
-                     UINT32 window)
-{
-    UINT32 peak = 0;
-    const UINT32 first = frame > window ? frame - window : 0;
-    const UINT32 last = frame + window;
-    for (UINT32 index = first; index < last; ++index)
-    {
-        const size_t base = static_cast<size_t>(index) * channels;
-        for (UINT32 channel = 0; channel < channels && base + channel < samples.size(); ++channel)
-        {
-            const int value = samples[base + channel];
-            const int magnitude = value < 0 ? -value : value;
-            if (magnitude > static_cast<int>(peak))
-            {
-                peak = static_cast<UINT32>(magnitude);
-            }
-        }
-    }
-    return peak;
-}
-
 // Deterministic check of the clock drift compensation.  Needs no audio device, so
 // it also runs on CI runners.  Route B is written as if its device ran 2000 ppm
 // (0.2%, far beyond any real crystal, chosen so the two marks stay clearly apart)
@@ -1993,9 +1970,8 @@ bool RunDriftSelfTest(SelfTestContext& context, const std::wstring& outputDir)
         // Offset independent analysis: only the *level* of the markers matters,
         // so a constant encoder delay cannot influence the result.  Two markers
         // landing on the same frame add up to roughly twice the amplitude of one.
-        std::vector<int16_t> samples;
         UINT64 decodedFrames = 0;
-        const UINT32 peak = mixed ? DecodedPeakLevel(output, &decodedFrames, &samples) : 0;
+        const UINT32 peak = mixed ? DecodedPeakLevel(output, &decodedFrames) : 0;
 
         const double ppm = mixResult.clockCorrectionPpm;
         const bool levelOk = expectAligned
@@ -2019,6 +1995,18 @@ bool RunDriftSelfTest(SelfTestContext& context, const std::wstring& outputDir)
 
     runCase(L"声明时钟差 2000 ppm（应补偿并对齐）", correctedM4a, nominal, nominal * drift, true);
     runCase(L"声明时钟相同（不补偿，两个标记各自独立）", controlM4a, nominal, nominal, false);
+
+    // The correction is reported to the user, so check the wording (and its units)
+    // against the numbers: 100 ppm is 0.0100 % and 0.36 s per hour.
+    const std::wstring wording = FormatClockCorrection(100.0);
+    const bool wordingOk = wording.find(L"0.0100%") != std::wstring::npos &&
+                           wording.find(L"0.36") != std::wstring::npos;
+    if (!wordingOk)
+    {
+        allOk = false;
+    }
+    context.Log(std::wstring(L"漂移自检 状态文案: ") + (wordingOk ? L"ok" : L"失败") + L" (" +
+                (wording.empty() ? std::wstring(L"<empty>") : wording) + L")");
 
     return allOk;
 }
