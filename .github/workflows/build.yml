@@ -145,3 +145,53 @@ jobs:
 
           Write-Host "attached sha256: $env:SHA256"
           gh release view $tag --json tagName,isDraft,assets
+
+      # Keep the Scoop manifest that ships with this repository in sync with the
+      # release that was just published, so `scoop install simplerecorder` always
+      # gets the current version.  bucket/simplerecorder.json is what Scoop reads;
+      # this workflow has to do the bump itself because a release created with
+      # GITHUB_TOKEN does not trigger further workflows.
+      - name: Sync the Scoop manifest
+        if: startsWith(github.ref, 'refs/tags/v') && !contains(github.ref_name, '-')
+        shell: pwsh
+        env:
+          SHA256: ${{ steps.artifact.outputs.sha256 }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $tag = $env:GITHUB_REF_NAME
+          $version = $tag.Substring(1)
+          $hash = $env:SHA256.ToLowerInvariant()
+          $asset = 'SimpleRecorder.exe'
+          $url = "https://github.com/$env:GITHUB_REPOSITORY/releases/download/$tag/$asset"
+          Write-Host "syncing the Scoop manifest to $version ($hash)"
+
+          # A tag build is a detached HEAD: put the commit on the default branch.
+          git fetch --depth=1 origin main
+          git checkout -B main FETCH_HEAD
+
+          # Rewrite only the top-level version / url / hash lines, leaving the file
+          # layout and the autoupdate templates untouched.  The Regex instance
+          # overload is required: the static [regex]::Replace($s, $p, $r, 1) treats
+          # 1 as RegexOptions (IgnoreCase) and replaces every match.
+          $path = 'bucket/simplerecorder.json'
+          if (-not (Test-Path $path)) { throw "$path is missing" }
+          $json = Get-Content -Raw $path
+          $json = ([regex]'(?m)^(\s*"version":\s*")[^"]*(")').Replace($json, "`${1}$version`${2}", 1)
+          $json = ([regex]'(?m)^(\s*"url":\s*")[^"]*(")').Replace($json,     "`${1}$url`${2}", 1)
+          $json = ([regex]'(?m)^(\s*"hash":\s*")[^"]*(")').Replace($json,    "`${1}$hash`${2}", 1)
+          Set-Content -Path $path -Value $json -NoNewline
+
+          # Fail the job rather than push a manifest that does not match the release.
+          $check = Get-Content -Raw $path | ConvertFrom-Json
+          if ($check.version -ne $version) { throw "version not written: $($check.version)" }
+          if ($check.hash -ne $hash)       { throw "hash not written: $($check.hash)" }
+          if ($check.autoupdate.url -notmatch '\$version') { throw 'autoupdate.url lost its $version placeholder' }
+          Write-Host "manifest ok: version=$($check.version) hash=$($check.hash.Substring(0, 12))..."
+
+          git config user.name  'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add $path
+          if (git diff --cached --quiet) { Write-Host 'manifest already up to date'; exit 0 }
+          git commit -m "scoop: $asset $version"
+          git push origin main
